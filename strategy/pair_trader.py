@@ -21,6 +21,7 @@ from config import *
 from exchange_client import ExchangeClient, OrderSide, OrderStatus, Order, OrderBook
 from signal_generator import RatioSignalGenerator, SignalDirection, Signal
 from risk_manager import RiskManager, TradeResult
+from cost_model import CostModel, TradeCostRecord
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,10 @@ class TradeRound:
     gross_pnl: float = 0.0
     fees: float = 0.0
     net_pnl: float = 0.0
+
+    # Cost-model feedback: pnl we PROJECTED at the moment of close decision,
+    # used to compute realized slippage against expectation.
+    expected_close_pnl_pct: float = 0.0
     
     # Layer info
     layer: int = 1
@@ -104,6 +109,20 @@ class HighFreqPairTrader:
             close_threshold=CLOSE_THRESHOLD,
             add_threshold_2=ADD_THRESHOLD_2,
             add_threshold_3=ADD_THRESHOLD_3,
+        )
+        
+        # Cost model — computes the *real* required profit target
+        # accounting for slippage, Taker fallback, funding, and oracle drift.
+        self.cost_model = CostModel(
+            maker_fee=MAKER_FEE,
+            taker_fee=TAKER_FEE,
+            default_slippage=DEFAULT_SLIPPAGE_PER_ROUND,
+            default_oracle_drift=DEFAULT_ORACLE_DRIFT,
+            taker_fallback_probability=TAKER_FALLBACK_PROBABILITY,
+            safety_margin_multiplier=SAFETY_MARGIN_MULTIPLIER,
+            min_target_profit=MIN_TARGET_PROFIT,
+            max_target_profit=MAX_TARGET_PROFIT,
+            slippage_window_size=SLIPPAGE_WINDOW_SIZE,
         )
         
         # Risk manager (will be initialized with actual equity)
@@ -141,10 +160,24 @@ class HighFreqPairTrader:
         logger.info("=" * 60)
         logger.info("HIGH-FREQ BTC/ETH PAIR TRADER STARTED")
         logger.info(f"  Maker fee: {MAKER_FEE*100:.3f}%")
-        logger.info(f"  Round-trip cost: {ROUND_TRIP_COST*100:.3f}%")
-        logger.info(f"  Target profit: {TARGET_PROFIT*100:.3f}%")
-        logger.info(f"  Open threshold: {OPEN_THRESHOLD*100:.3f}%")
-        logger.info(f"  Scan interval: {SCAN_INTERVAL}s")
+        logger.info(f"  Taker fee: {TAKER_FEE*100:.3f}%")
+        logger.info(f"  Best-case round-trip: {ROUND_TRIP_COST_BEST_CASE*100:.3f}% (Maker only)")
+        logger.info(f"  MIN target profit:    {MIN_TARGET_PROFIT*100:.3f}%")
+        logger.info(f"  MAX target profit:    {MAX_TARGET_PROFIT*100:.3f}%")
+        logger.info(f"  Open threshold:       {OPEN_THRESHOLD*100:.3f}%")
+        logger.info(f"  Stop loss:            {STOP_LOSS*100:.3f}%")
+        logger.info(f"  Scan interval:        {SCAN_INTERVAL}s")
+        # Log the initial cost model breakdown so operators see what's expected
+        breakdown = self.cost_model.cost_breakdown(
+            direction="long_eth_short_btc",
+            expected_hold_seconds=600,
+        )
+        logger.info(f"  Cost breakdown @ 10min hold:")
+        logger.info(f"    fee:      {breakdown['fee_pct']:.4f}%")
+        logger.info(f"    slippage: {breakdown['slippage_pct']:.4f}%")
+        logger.info(f"    funding:  {breakdown['funding_pct']:.4f}%")
+        logger.info(f"    oracle:   {breakdown['oracle_pct']:.4f}%")
+        logger.info(f"    -> required target: {breakdown['required_target_pct']:.4f}%")
         logger.info("=" * 60)
 
         while self._running:
@@ -171,8 +204,9 @@ class HighFreqPairTrader:
         One cycle of the strategy:
         1. Fetch prices
         2. Update signal
-        3. Manage active rounds (check timeouts, fills)
-        4. Open new rounds if signal present and risk allows
+        3. Refresh cost model with latest funding rates (cheap, async-safe)
+        4. Manage active rounds (check timeouts, fills)
+        5. Open new rounds if signal present and risk allows
         """
         # 1. Fetch current prices
         btc_price = await self.client.get_mark_price(BTC_SYMBOL)
@@ -184,10 +218,27 @@ class HighFreqPairTrader:
         # 2. Update signal generator
         signal = self.signal_gen.update(eth_price, btc_price)
 
-        # 3. Manage active rounds
+        # 3. Refresh funding rates in the cost model.
+        # Fetched on every tick is fine; the exchange caches and they only
+        # change every 8 hours. If the API call fails we just keep the last
+        # known values — better than guessing.
+        try:
+            btc_fr = await self.client.get_funding_rate(BTC_SYMBOL)
+            eth_fr = await self.client.get_funding_rate(ETH_SYMBOL)
+            self.cost_model.update_funding_rates(
+                btc_funding_rate=btc_fr.get("predicted_rate", btc_fr.get("current_rate", 0.0)),
+                eth_funding_rate=eth_fr.get("predicted_rate", eth_fr.get("current_rate", 0.0)),
+            )
+        except NotImplementedError:
+            # Exchange client stub — funding cost will stay at 0 until implemented
+            pass
+        except Exception as e:
+            logger.debug(f"Funding rate fetch failed (non-fatal): {e}")
+
+        # 4. Manage active rounds
         await self._manage_active_rounds(signal, eth_price, btc_price)
 
-        # 4. Check for new entry
+        # 5. Check for new entry
         if signal.direction in (SignalDirection.LONG_ETH_SHORT_BTC, SignalDirection.SHORT_ETH_LONG_BTC):
             await self._try_open_new_round(signal, eth_price, btc_price)
 
@@ -205,6 +256,28 @@ class HighFreqPairTrader:
         margin_usage = await self.client.get_margin_usage()
         if not self.risk_mgr.check_margin(margin_usage):
             logger.debug("Margin limit reached, skipping new round")
+            return
+
+        # ================================================================
+        # COST FLOOR CHECK (critical: prevents opening at sub-margin signals)
+        # ================================================================
+        # The signal said "open" because deviation > OPEN_THRESHOLD, but we
+        # must independently verify that the deviation is large enough to
+        # cover real round-trip cost (fees + slippage + funding + buffer).
+        #
+        # Without this check, a 0.05% deviation triggers an open whose
+        # round-trip cost is 0.07%+, guaranteeing a net loss.
+        direction_str = signal.direction.value
+        required_target = self.cost_model.required_target_profit(
+            direction=direction_str,
+            expected_hold_seconds=300,  # Assume ~5min average hold for entry decision
+        )
+        if abs(signal.deviation) < required_target:
+            logger.debug(
+                f"Skip open: deviation {signal.deviation*100:.4f}% < "
+                f"required_target {required_target*100:.4f}% "
+                f"(would not cover real costs)"
+            )
             return
 
         # Calculate position size
@@ -392,40 +465,87 @@ class HighFreqPairTrader:
     async def _check_exit_conditions(
         self, trade_round: TradeRound, signal: Signal, eth_price: float, btc_price: float
     ):
-        """Check if holding position should be closed."""
-        
+        """
+        Check if holding position should be closed.
+
+        Exit conditions, evaluated in priority order:
+          1. STOP LOSS — bleed control, always wins
+          2. TIMEOUT — cap exposure to funding/oracle drift over time
+          3. DYNAMIC TARGET — pnl covers (fees + slippage + funding + safety margin)
+          4. SIGNAL CLOSE — ratio reverted, but only if pnl is above the *real*
+             cost floor (NOT the naive 0.02% maker-only number)
+
+        The dynamic target replaces the old hardcoded TARGET_PROFIT and
+        ROUND_TRIP_COST checks, which under-estimated true cost and could
+        close trades at a real-world net loss.
+        """
         hold_time = time.time() - trade_round.open_time
-        current_ratio = eth_price / btc_price
-        
+
+        # Compute the LIVE required profit floor from the cost model.
+        # This number changes over time as funding accrues and as the model
+        # learns from realized slippage.
+        direction_str = trade_round.direction.value
+        required_target = self.cost_model.required_target_profit(
+            direction=direction_str,
+            expected_hold_seconds=hold_time,  # Use ACTUAL hold so funding cost grows over time
+        )
+
+        # Real-world break-even floor: the absolute minimum pnl below which
+        # closing is a guaranteed net loss after fees+slippage+funding.
+        # Used for the "signal close" decision so we don't dump on noise.
+        breakeven_floor = (
+            self.cost_model.fee_cost()
+            + self.cost_model.slippage_cost()
+            + max(0.0, self.cost_model.funding_cost(direction_str, hold_time))
+            + self.cost_model.oracle_cost()
+        )
+
         # Calculate current P&L of this round
         pnl_pct = self._calc_round_pnl_pct(trade_round, eth_price, btc_price)
 
         should_close = False
         reason = ""
 
-        # Condition 1: Target profit reached
-        if pnl_pct >= TARGET_PROFIT:
+        # Condition 1: Stop loss — highest priority
+        if pnl_pct <= -STOP_LOSS:
             should_close = True
-            reason = f"TARGET HIT ({pnl_pct*100:.4f}%)"
+            reason = f"STOP LOSS (pnl={pnl_pct*100:.4f}%)"
 
-        # Condition 2: Signal says close (ratio reverted)
-        elif signal.direction == SignalDirection.CLOSE:
-            if pnl_pct > ROUND_TRIP_COST:  # Only close if profitable after fees
-                should_close = True
-                reason = f"SIGNAL CLOSE ({pnl_pct*100:.4f}%)"
-
-        # Condition 3: Stop loss
-        elif pnl_pct <= -STOP_LOSS:
-            should_close = True
-            reason = f"STOP LOSS ({pnl_pct*100:.4f}%)"
-
-        # Condition 4: Max hold time
+        # Condition 2: Max hold timeout
         elif hold_time > MAX_HOLD_SECONDS:
             should_close = True
-            reason = f"TIMEOUT ({hold_time:.0f}s)"
+            reason = f"TIMEOUT (held {hold_time:.0f}s)"
+
+        # Condition 3: Dynamic target reached — pnl exceeds real cost + safety margin
+        elif pnl_pct >= required_target:
+            should_close = True
+            reason = (
+                f"TARGET HIT (pnl={pnl_pct*100:.4f}% >= required={required_target*100:.4f}%)"
+            )
+
+        # Condition 4: Signal close — ratio reverted, but only if profitable after REAL costs
+        elif signal.direction == SignalDirection.CLOSE:
+            if pnl_pct > breakeven_floor:
+                should_close = True
+                reason = (
+                    f"SIGNAL CLOSE (pnl={pnl_pct*100:.4f}% > "
+                    f"breakeven={breakeven_floor*100:.4f}%)"
+                )
+            else:
+                # Ratio reverted but we'd lose money closing now.
+                # Hold and wait for either target or stop loss.
+                logger.debug(
+                    f"Round #{trade_round.id} | Signal CLOSE ignored: "
+                    f"pnl={pnl_pct*100:.4f}% below breakeven={breakeven_floor*100:.4f}%"
+                )
 
         if should_close:
-            logger.info(f"Round #{trade_round.id} | Closing: {reason}")
+            logger.info(
+                f"Round #{trade_round.id} | Closing: {reason} | "
+                f"hold={hold_time:.0f}s"
+            )
+            # Stash the expected pnl so the cost model can learn slippage on close
+            trade_round.expected_close_pnl_pct = pnl_pct
             await self._start_close(trade_round)
 
     def _calc_round_pnl_pct(
@@ -852,10 +972,28 @@ class HighFreqPairTrader:
         self.risk_mgr.record_trade(result)
         self.risk_mgr.on_layer_closed()
 
+        # ============================================================
+        # Cost model feedback: teach the model what slippage we actually had
+        # so future required_target_profit() values reflect this venue's reality.
+        # ============================================================
+        actual_gross_pnl_pct = gross_pnl / total_notional if total_notional > 0 else 0.0
+        cost_record = TradeCostRecord(
+            timestamp=trade_round.close_time,
+            expected_gross_pnl_pct=trade_round.expected_close_pnl_pct,
+            actual_gross_pnl_pct=actual_gross_pnl_pct,
+            fees_paid_pct=total_fees / total_notional if total_notional > 0 else 0.0,
+            funding_paid_pct=0.0,  # TODO: wire actual funding settlements when available from API
+            forced_taker=forced_taker,
+            hold_seconds=trade_round.close_time - trade_round.open_time,
+        )
+        self.cost_model.record_trade(cost_record)
+
         status = "⚠️ TAKER USED" if forced_taker else "✅"
         logger.info(
             f"Round #{trade_round.id} | CLOSED {status} | "
             f"Gross={gross_pnl:.4f} | Fees={total_fees:.4f} | Net={net_pnl:.4f} USDT | "
+            f"Expected_pnl%={trade_round.expected_close_pnl_pct*100:.4f}% "
+            f"Actual_pnl%={actual_gross_pnl_pct*100:.4f}% | "
             f"Duration={result.hold_duration:.1f}s | "
             f"Volume=${open_notional + close_notional:.0f}"
         )
@@ -936,6 +1074,7 @@ class HighFreqPairTrader:
         runtime = time.time() - self._start_time
         signal_stats = self.signal_gen.get_stats()
         risk_stats = self.risk_mgr.get_stats() if self.risk_mgr else {}
+        cost_stats = self.cost_model.get_stats()
 
         return {
             "runtime_hours": runtime / 3600,
@@ -945,4 +1084,5 @@ class HighFreqPairTrader:
             "total_rounds": self._round_counter,
             "signal": signal_stats,
             "risk": risk_stats,
+            "cost_model": cost_stats,
         }
