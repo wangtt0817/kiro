@@ -1,4 +1,22 @@
-# 波动率套利需要的完整工具链
+# 波动率套利需要的完整工具链（不适用于 MemeMax）
+
+> 🚫 **本策略在 MemeMax 上无法实施**
+>
+> 波动率套利的核心工具是**期权**（Options），用于直接交易波动率。
+> MemeMax 是纯永续合约（PERP）DEX，**不提供期权产品**，因此本策略不可用。
+>
+> 如果未来想做波动率套利，需要使用 [Deribit](https://www.deribit.com/)（占加密期权市场 85% 份额）等期权交易所。
+>
+> 本文保留作为知识库，介绍：
+> - 波动率套利的核心原理（IV vs RV、跨资产 vol spread）
+> - 需要的工具链（DVOL 指数、Greeks 计算、Delta hedging bot）
+> - 为什么 MemeMax 上做不了（关键缺失：Vega/Gamma/Theta 没有载体）
+>
+> 当前 MemeMax 上**有效**的策略请见 [`docs/01_MAIN_Strategy.md`](../01_MAIN_Strategy.md)。
+
+---
+
+## 概述
 
 波动率套利与方向性策略有本质区别——它交易的是**波动率本身**，而非价格方向。这需要一套专门的工具和基础设施。
 
