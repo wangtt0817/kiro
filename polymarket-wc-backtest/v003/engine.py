@@ -174,40 +174,43 @@ class Engine:
         gross_remaining = max(0.0, cap_gross - self._gross_exposure)
         return min(requested, team_remaining, gross_remaining)
 
-    # -- trade lifecycle --------------------------------------------------
-    def open_position(
+    # -- raw primitives ---------------------------------------------------
+    def enter(
         self,
         strategy: str,
         team: str,
         direction: str,
-        mid_price: float,
-        model_prob: float,
+        fill_price: float,
+        stake: float,
         ts: str,
+        model_prob: float,
+        mid_price: Optional[float] = None,
         horizon_days: int = 1,
+        apply_caps: bool = True,
     ) -> Optional[Position]:
-        if not (0.0 < mid_price < 1.0):
-            return None
+        """Open a position at an EXPLICIT leg-space fill price and stake.
 
-        # Effective fill price for buying the chosen leg.
-        if direction == DIR_YES:
-            fill = self.cost.buy_price(mid_price)
-            p_market_for_kelly = mid_price
-        elif direction == DIR_NO:
-            fill = self.cost.buy_price(1.0 - mid_price)  # buying NO = buying at q = 1 - p
-            p_market_for_kelly = mid_price
-        else:
+        ``fill_price`` is the price actually paid for one share of the chosen
+        leg (already in YES-space for YES, in NO-space ``q = 1 - p`` for NO).
+        Used directly by market-making and structural-arb strategies that
+        compute their own fills; ``open_position`` is a convenience wrapper that
+        derives ``fill_price``/``stake`` from a mid + Kelly.
+        """
+        if direction not in (DIR_YES, DIR_NO):
             return None
-
-        requested = self._kelly_stake(direction, model_prob, p_market_for_kelly)
-        stake = self._allowed_stake(team, requested)
+        if not (0.0 < fill_price < 1.0):
+            return None
+        if apply_caps:
+            stake = self._allowed_stake(team, stake)
         if stake < self.pcfg.min_stake_dollars:
             return None
-
-        shares = stake / fill if fill > 0 else 0.0
+        shares = stake / fill_price
         if shares <= 0:
             return None
 
         fee_entry = stake * self.cost.taker_fee_rate
+        if mid_price is None:
+            mid_price = fill_price if direction == DIR_YES else (1.0 - fill_price)
 
         pos = Position(
             strategy=strategy,
@@ -215,7 +218,7 @@ class Engine:
             direction=direction,
             entry_date=ts,
             entry_mid=mid_price,
-            entry_fill=fill,
+            entry_fill=fill_price,
             shares=shares,
             stake=stake,
             fee_paid_entry=fee_entry,
@@ -225,38 +228,25 @@ class Engine:
         self.positions.append(pos)
         self._team_exposure[team] = self._team_exposure.get(team, 0.0) + stake
         self._gross_exposure += stake
-        # Cash accounting: stake leaves cash (it's tied up in shares) and the
-        # entry fee is realized immediately.
+        # Stake leaves cash (tied up in shares); entry fee realized immediately.
         self.capital -= (stake + fee_entry)
         return pos
 
-    def close_position(self, pos: Position, exit_mid: float, exit_date: str) -> Trade:
+    def close_at_fill(self, pos: Position, exit_fill: float, exit_mid: float,
+                      exit_date: str) -> Trade:
+        """Close ``pos`` at an EXPLICIT leg-space exit fill price."""
         if not pos.open:
             raise RuntimeError("position already closed")
+        exit_fill = min(self.cost.max_price, max(self.cost.min_price, exit_fill))
 
-        if pos.direction == DIR_YES:
-            exit_fill = self.cost.sell_price(exit_mid)
-            entry_p = pos.entry_fill
-            exit_p = exit_fill
-        else:  # DIR_NO -> selling NO = selling at q' = 1 - exit_mid
-            exit_fill = self.cost.sell_price(1.0 - exit_mid)
-            entry_p = pos.entry_fill
-            exit_p = exit_fill
-
-        gross_exit = pos.shares * exit_p
+        gross_exit = pos.shares * exit_fill
         fee_exit = gross_exit * self.cost.taker_fee_rate
-        # Cash returned at close.
         realized_cash = gross_exit - fee_exit
-        # Round-trip PnL: total cash in minus total cash out (stake + entry fee).
         pnl = realized_cash - pos.stake - pos.fee_paid_entry
         self.capital += realized_cash
-        # Drawdown is tracked in `mark_to_market` against equity; the cash
-        # value here is not a meaningful DD signal on its own.
 
-        # Update exposure
         self._team_exposure[pos.team] = max(0.0, self._team_exposure.get(pos.team, 0.0) - pos.stake)
         self._gross_exposure = max(0.0, self._gross_exposure - pos.stake)
-
         pos.open = False
 
         if pos.direction == DIR_YES:
@@ -286,6 +276,49 @@ class Engine:
         )
         self.trades.append(tr)
         return tr
+
+    # -- trade lifecycle (mid + Kelly convenience wrappers) ---------------
+    def open_position(
+        self,
+        strategy: str,
+        team: str,
+        direction: str,
+        mid_price: float,
+        model_prob: float,
+        ts: str,
+        horizon_days: int = 1,
+    ) -> Optional[Position]:
+        if not (0.0 < mid_price < 1.0):
+            return None
+
+        # Effective fill price for buying the chosen leg.
+        if direction == DIR_YES:
+            fill = self.cost.buy_price(mid_price)
+        elif direction == DIR_NO:
+            fill = self.cost.buy_price(1.0 - mid_price)  # buying NO = buying at q = 1 - p
+        else:
+            return None
+
+        requested = self._kelly_stake(direction, model_prob, mid_price)
+        return self.enter(
+            strategy=strategy,
+            team=team,
+            direction=direction,
+            fill_price=fill,
+            stake=requested,
+            ts=ts,
+            model_prob=model_prob,
+            mid_price=mid_price,
+            horizon_days=horizon_days,
+            apply_caps=True,
+        )
+
+    def close_position(self, pos: Position, exit_mid: float, exit_date: str) -> Trade:
+        if pos.direction == DIR_YES:
+            exit_fill = self.cost.sell_price(exit_mid)
+        else:  # DIR_NO -> selling NO = selling at q' = 1 - exit_mid
+            exit_fill = self.cost.sell_price(1.0 - exit_mid)
+        return self.close_at_fill(pos, exit_fill, exit_mid, exit_date)
 
     def mark_to_market(self, mid_prices: Dict[str, float], date: str) -> float:
         """Mark open positions to a snapshot of mid prices and record equity.
