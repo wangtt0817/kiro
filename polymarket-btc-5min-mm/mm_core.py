@@ -101,6 +101,14 @@ class SimConfig:
     open_price: float = 100_000.0       # strike K = window open price
     drift_annual: float = 0.0           # no drift over 5 min
 
+    # --- regime switching (only used by simulate_window_regime) ---
+    # Real BTC vol is heteroskedastic: hours of "calm" (~30%) interrupted by spikes
+    # (>120% during macro events / liquidations). A constant sigma understates how
+    # often Stage 0 must perform under a vol regime DIFFERENT from the one the model
+    # is calibrated against, which is exactly the kind of failure the doc warns about.
+    regime_sigmas: tuple = (0.30, 0.55, 1.20)        # low / medium / high
+    regime_weights: tuple = (0.40, 0.45, 0.15)        # share of windows in each regime
+
     # Market microstructure
     mkt_lag_s: int = 4                  # how stale the Polymarket mid is vs CEX spot
     mkt_noise: float = 0.012            # gaussian noise on the market mid (prob units)
@@ -138,33 +146,21 @@ class MarketWindow:
         return self.t_remaining(t) / SECONDS_PER_YEAR
 
 
-def simulate_window(cfg: SimConfig, rng: random.Random) -> MarketWindow:
-    """Generate one 5-minute window.
+def build_window_from_path(S: List[float], sigma: float, cfg: SimConfig,
+                            rng: random.Random) -> MarketWindow:
+    """Wrap a given 1-Hz BTC spot path (length n+1) in the microstructure model.
 
-    The two effects that matter:
-      * The market mid is priced off a *stale* spot (mkt_lag_s seconds old) plus noise
-        and a mild pull toward 0.5 (documented mid-probability mispricing). Because the
-        FRESH spot is the best predictor of settlement, trading toward the fresh fair
-        value is +EV -> this is the synthetic 'edge' Direction 3 is meant to detect.
-      * Taker flow is informed: a taker is more likely to trade in the direction of the
-        *next* spot move. A maker resting at the stale mid therefore gets adversely
-        selected -> this is the cost Directions 1/2/5/6 must overcome.
+    This is the SHARED kernel used by both:
+      * simulate_window  — feeds it a synthetic GBM path (with optional regime sigma)
+      * historical_replay.replay_window — feeds it a real path interpolated from
+        cached 1-minute klines.
+    Splitting it out is what makes "validate the same engine on real data" trivial.
     """
     n = WINDOW_SECONDS
-    K = cfg.open_price
-    sigma = cfg.sigma_annual
-    dt_yr = DT / SECONDS_PER_YEAR
-    mu = cfg.drift_annual
+    if len(S) != n + 1:
+        raise ValueError(f"BTC path must have length {n+1}, got {len(S)}")
 
-    # --- BTC spot path (GBM) ---
-    S = [K]
-    for _ in range(n):
-        z = rng.gauss(0.0, 1.0)
-        s_prev = S[-1]
-        s_next = s_prev * math.exp((mu - 0.5 * sigma ** 2) * dt_yr + sigma * math.sqrt(dt_yr) * z)
-        S.append(s_next)
-    # S has length n+1 (S[0]..S[n]); settlement uses S[n]
-
+    K = S[0]
     settle_price = S[n]
     settle_up = settle_price >= K
 
@@ -179,7 +175,7 @@ def simulate_window(cfg: SimConfig, rng: random.Random) -> MarketWindow:
     for t in range(n):
         T_rem_yr = max(1e-9, (n - t) / SECONDS_PER_YEAR)
 
-        # true fair using fresh spot
+        # true fair using FRESH spot
         f = DigitalOptionEngine.fair(S[t], K, T_rem_yr, sigma)
         fair.append(f)
 
@@ -192,9 +188,7 @@ def simulate_window(cfg: SimConfig, rng: random.Random) -> MarketWindow:
         best_bid.append(min(0.99, max(0.01, m - cfg.mkt_half_spread)))
         best_ask.append(min(0.99, max(0.01, m + cfg.mkt_half_spread)))
 
-        # informed taker flow: biased by the move over the next `taker_lookahead_s`
-        # seconds (not just the next tick) -> makers who get filled are disproportionately
-        # on the wrong side, which is what real adverse selection feels like.
+        # informed taker flow biased by the move over the next `taker_lookahead_s` s
         look = min(n, t + cfg.taker_lookahead_s)
         fwd = S[look] - S[t]
         up_move = fwd >= 0
@@ -211,6 +205,65 @@ def simulate_window(cfg: SimConfig, rng: random.Random) -> MarketWindow:
         taker_buy=taker_buy, taker_sell=taker_sell, taker_size=taker_size,
         settle_up=settle_up, settle_price=settle_price,
     )
+
+
+def simulate_window(cfg: SimConfig, rng: random.Random,
+                    sigma_override: float | None = None) -> MarketWindow:
+    """Generate one 5-minute window with a SYNTHETIC GBM BTC path.
+
+    The two effects that matter:
+      * The market mid is priced off a *stale* spot (mkt_lag_s seconds old) plus noise
+        and a mild pull toward 0.5 (documented mid-probability mispricing). Because the
+        FRESH spot is the best predictor of settlement, trading toward the fresh fair
+        value is +EV -> this is the synthetic 'edge' Direction 3 is meant to detect.
+      * Taker flow is informed: a taker is more likely to trade in the direction of the
+        *next* spot move. A maker resting at the stale mid therefore gets adversely
+        selected -> this is the cost Directions 1/2/5/6 must overcome.
+
+    `sigma_override` lets the regime-switching driver vary vol per window without
+    forcing a new SimConfig allocation.
+    """
+    n = WINDOW_SECONDS
+    sigma = sigma_override if sigma_override is not None else cfg.sigma_annual
+    dt_yr = DT / SECONDS_PER_YEAR
+    mu = cfg.drift_annual
+    K = cfg.open_price
+
+    S = [K]
+    for _ in range(n):
+        z = rng.gauss(0.0, 1.0)
+        s_prev = S[-1]
+        s_next = s_prev * math.exp((mu - 0.5 * sigma ** 2) * dt_yr
+                                    + sigma * math.sqrt(dt_yr) * z)
+        S.append(s_next)
+    return build_window_from_path(S, sigma, cfg, rng)
+
+
+def simulate_window_regime(cfg: SimConfig, rng: random.Random) -> MarketWindow:
+    """Generate one 5-min window where the per-window sigma is drawn from a
+    discrete vol regime (low / medium / high).
+
+    This is the in-sandbox stand-in for "real BTC heteroskedasticity" — when external
+    HTTP is blocked we cannot fetch real klines, but we CAN at least stop pretending
+    that BTC vol is a single constant. The regime mix `(0.40, 0.45, 0.15)` over
+    `(30%, 55%, 120%)` annualised approximates the empirical distribution of 5-min
+    realised vols on BTC over the last few quarters; tweak via SimConfig if your
+    sample says otherwise.
+    """
+    sigmas = cfg.regime_sigmas
+    weights = cfg.regime_weights
+    if len(sigmas) != len(weights) or abs(sum(weights) - 1.0) > 1e-6:
+        raise ValueError("regime_sigmas and regime_weights must align and sum to 1")
+
+    u = rng.random()
+    acc = 0.0
+    chosen = sigmas[-1]
+    for s, w in zip(sigmas, weights):
+        acc += w
+        if u <= acc:
+            chosen = s
+            break
+    return simulate_window(cfg, rng, sigma_override=chosen)
 
 
 # ============================================================
@@ -422,7 +475,8 @@ def mm_half_spread(cfg: MMConfig, t_remaining_s: float, sigma: float, inventory:
 
 __all__ = [
     "SECONDS_PER_YEAR", "WINDOW_SECONDS", "DT", "SECONDS_PER_DAY",
-    "DigitalOptionEngine", "SimConfig", "MarketWindow", "simulate_window",
+    "DigitalOptionEngine", "SimConfig", "MarketWindow",
+    "simulate_window", "simulate_window_regime", "build_window_from_path",
     "TokenBook", "HedgeBook", "hedge_target_qty",
     "WindowResult", "compute_metrics", "format_metrics_table",
     "MMConfig", "mm_half_spread",

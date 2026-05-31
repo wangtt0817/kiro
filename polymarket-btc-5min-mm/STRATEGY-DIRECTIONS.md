@@ -16,7 +16,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `mm_core.py` | 共享核心：数字期权定价（修正 greeks）、合成 5min 窗口生成、净库存账本 `TokenBook`、**逐笔盯市对冲账本** `HedgeBook`、指标计算 |
+| `mm_core.py` | 共享核心：数字期权定价（修正 greeks）、合成 5min 窗口生成、净库存账本 `TokenBook`、**逐笔盯市对冲账本** `HedgeBook`、指标计算、**`build_window_from_path` 共享内核**（合成与回放共用）、`simulate_window_regime` 波动率体制切换 |
 | `mm_engine.py` | 一个可配置的做市引擎 `run_mm_window`，用 `hedge/rebate/signal_skew` 三个开关驱动方向 1/2/5/6 |
 | `direction1_pure_mm.py` | 方向 1：纯做市价差捕获（修好的 Strategy A）+ 对冲开/关对照实验 |
 | `direction2_rebate_farm.py` | 方向 2：返佣农场（修好的 Strategy B） |
@@ -25,13 +25,23 @@
 | `direction5_mm_skew.py` | 方向 5：做市 + 方向偏斜（目标态） |
 | `direction6_combined_book.py` | 方向 6：单一净库存合并账本（价差 + 返佣 + 偏斜） |
 | `run_all_directions.py` | 一键跑全部 6 个方向，输出对比表 + 分腿 PnL 归因 |
+| **`fetch_btc_data.py`** | **真实数据抓取脚本（需要外网，离开沙箱在本机/VPS 运行）**，写入 `data/btc_1m_*.json` |
+| **`historical_data.py`** | 加载 klines 缓存，把 1 分钟 OHLC 线性插值到 1 秒，按 5 分钟边界切窗口 |
+| **`historical_replay.py`** | `simulate_window` 的 drop-in 替代品：用真实 BTC 路径 + 同一套微结构模型构建 `MarketWindow` |
+| **`stage0_validation.py`** | **阶段 0 验证 gate**：Brier 校准、edge 桶分层胜率、t_remaining 桶分层胜率、PASS/FAIL 判定 |
 
 运行：
 
 ```bash
+# 6方向对比（合成）
 python run_all_directions.py            # 默认 3000 窗口
 python run_all_directions.py 8000 123   # 自定义 窗口数 / 随机种子
 python direction1_pure_mm.py            # 单独看方向1 + 对冲对照实验
+
+# 阶段0 验证（合成 / 真实数据 / 体制切换）
+python stage0_validation.py --mode regime --windows 4000           # 沙箱内体制切换
+python fetch_btc_data.py --days 30                                 # 在有外网的机器跑
+python stage0_validation.py --mode real --klines data/btc_1m_30d_binance.json
 ```
 
 ---
@@ -145,3 +155,148 @@ python direction1_pure_mm.py            # 单独看方向1 + 对冲对照实验
 
 *实现说明：纯标准库 + `math.erf`（无需 scipy）。所有方向共享 `mm_core.simulate_window`，
 保证可比性。把该函数替换为真实数据回放即可用于实盘前评估。*
+
+
+
+---
+
+## 6. 真实数据回放与阶段 0 验证
+
+设计文档要求：**写任何方向性策略代码之前，先用真实历史数据做"阶段 0 纸面验证"**，
+回答一个问题：「如果我在每个 |edge|>3% 且确认信号同向的时刻按规则下注，胜率/Sharpe 是多少？」
+胜率 < 54%、Brier > 0.22 或 PnL < 0 → 直接砍掉方向 3 这条线，省下后面所有工程投入。
+
+### 6.1 三层数据源
+
+| 模式 | 命令 | BTC 路径 | 微结构（Polymarket mid / 订单簿） | 何时使用 |
+|------|------|----------|--------------------------------------|----------|
+| `--mode synthetic` | `python stage0_validation.py --mode synthetic` | 常波动率 GBM | 模型构造 | 最简单的 sanity baseline |
+| `--mode regime` | `python stage0_validation.py --mode regime` | 体制切换 GBM（30%/55%/120%）| 模型构造 | **沙箱内默认**：BTC 异方差近似真实 |
+| **`--mode real`** | `python stage0_validation.py --mode real --klines data/btc_1m_30d_binance.json` | **真实 1 分钟插值到 1 秒** | 仍然模型构造 | **唯一允许给"是否进入阶段 1"做决策的口径** |
+
+### 6.2 真实数据怎么进来
+
+沙箱网络是 `INTEGRATIONS_ONLY`，外网全部 403/拒绝连接，**抓数据这一步必须离开沙箱**：
+
+```bash
+# 在你的本机/VPS 上（有外网）
+python fetch_btc_data.py --days 30                       # 默认 Binance
+python fetch_btc_data.py --days 30 --source coinbase     # Binance 被屏蔽时退到 Coinbase
+
+# 把 data/btc_1m_30d_*.json 复制回仓库的 polymarket-btc-5min-mm/data/ 目录
+# 然后回到沙箱（或任何能跑 Python 的机器）
+python stage0_validation.py --mode real --windows 4000
+```
+
+`fetch_btc_data.py` 仅用标准库（`urllib`），自动分页、礼貌限速，输出严格 JSON 格式
+被 `historical_data.load_klines()` 消费。这套 pipeline **离线可重现**：缓存文件确定，
+回放结果确定。
+
+### 6.3 真实数据模式下到底"有多真实"
+
+| 维度 | 真实? | 说明 |
+|------|------|------|
+| BTC 1 秒价格路径 | ✅ 真实 | 1m 线性插值（捕获分钟级漂移与协方差，不伪造亚分钟噪声） |
+| 每窗口已实现波动率 | ✅ 真实 | 从 30 分钟 lookback 算（无前瞻偏差） |
+| 结算 Up/Down | ✅ 真实 | 真 BTC 在 t=300s 与开盘价比较 |
+| 波动率体制分布 | ✅ 真实 | 不预设正态、保留肥尾 |
+| 日内季节性（CPI/FOMC、美开盘等） | ✅ 真实 | 自动反映在 BTC 路径中 |
+| **Polymarket market mid** | ⚠️ **仍模型化** | `lagged_fair + revert + gauss(noise)` |
+| 最优买/卖价 | ⚠️ 仍模型化 | mid ± half_spread |
+| Taker 到达 / 大小 / 方向 | ⚠️ 仍模型化 | 知情比例 × 真实前向价格 |
+
+**这个限制非常关键**：真实模式下 BTC 路径与结算结果都是真的，但**"市场是否真的偏离公允价"
+仍然是建模假设**。要彻底闭环，需要再获取一段历史的 Polymarket CLOB 订单簿快照（每 5 秒一次的
+`/book` 拉取，写入 SQLite/Parquet），然后把 `mm_core.build_window_from_path` 里的微结构块
+换成"回放真实订单簿"。届时各方向代码**无需改动**——这是一开始就把 `build_window_from_path`
+拆成共享内核的回报。
+
+### 6.4 阶段 0 报告四件套（`stage0_validation.py` 的输出）
+
+按设计文档的 KPI 一一给出诊断：
+
+1. **Brier 评分 + 校准表（在 t_remaining=120s 抽样）**
+   - 横看预测概率桶 vs 实际胜率，验证 BS digital 是否系统性偏移
+   - **Gate**: Brier < 0.22
+2. **按 |edge| 桶分层的胜率与平均 PnL**
+   - 验证"edge 越大胜率越高"是否真有单调性；如果 0.03–0.05 桶胜率反而高于 0.10–0.15 桶，
+     说明所谓 edge 是噪音
+3. **按 t_remaining 桶分层的胜率与平均 PnL**
+   - 文档断言 120s..30s 是甜蜜区，这一桶必须显著高于其他桶
+4. **整体 Direction 3 指标 + PASS/FAIL 判定**
+   - **Gate**: 胜率 > 54%  AND  盈利因子 > 1.2  AND  PnL > 0  AND  Brier < 0.22
+   - 任一不过 → 该方向暂时砍掉，先不要进阶段 1
+
+### 6.5 沙箱内体制切换合成数据下的阶段 0 demo（4000 窗口）
+
+**注意：以下结果是合成的、edge 是构造的，PASS 只能说明 pipeline 工作正常，不能说明真实市场存在 edge。**
+
+```
+=== Stage 0 validation (regime) ===
+windows                : 4000
+
+-- Direction 3 metrics --
+  trades             : 1966
+  win rate           : 69.3%   (gate: > 54%)
+  profit factor      : 1.23    (gate: > 1.2)
+  total PnL          : 2742.04 (gate: > 0)
+  per-window Sharpe  : 0.050
+  max drawdown       : 23.1%
+
+-- Calibration of P_fair @ t_remaining=120s --
+  Brier score        : 0.152   (gate: < 0.22)
+  bucket  predicted  realised   n
+  0.00-0.10    0.043    0.055   568
+  0.10-0.20    0.153    0.163   417
+  0.20-0.30    0.250    0.235   340
+  ...
+  0.80-0.90    0.851    0.848   356
+  0.90-1.00    0.959    0.970   562
+
+-- Win rate by Layer-1 edge bucket --
+  edge_range          n   win%   avg_pnl
+  0.03..0.05        970   74.5    0.901
+  0.05..0.07        444   66.9    0.564
+  0.07..0.10        342   58.8    0.555
+  0.10..0.15        186   67.2    6.321
+  0.15..1.00         24   70.8   10.519
+
+-- Win rate by t_remaining bucket --
+  t_rem_range         n   win%   avg_pnl
+  120..150s         688   71.9    1.775
+   90..120s        1262   67.9    1.271
+   60.. 90s          15   66.7   -5.660
+   30.. 60s           1  100.0    2.174
+
+VERDICT: PASS — proceed to Stage 1
+  NOTE: synthetic data; PASS only means the pipeline works correctly.
+        Re-run --mode real before drawing any live-market conclusion.
+```
+
+**怎么读这份报告**：
+- 校准表（`predicted ≈ realised` 各档）说明 BS digital 在体制切换的合成世界里是良好的真概率近似
+- edge 桶不是严格单调（0.07-0.10 桶胜率最低），暗示即使在合成世界里 edge 也不是 noise-free 信号
+- 120-150s 桶胜率最高（71.9%）符合文档对甜蜜区的判断；60-90s 样本太少是因为 Direction 3 的
+  `trade_start_s=120` 只允许在最早 180s 之前进单
+- Brier 0.152 < 0.22 安全过线；总 PF 1.23 刚刚过 1.2，**真实数据上很容易跌穿这条线**
+
+### 6.6 路线图（更新版）
+
+```
+[当前]  阶段 0 pipeline 全套就绪（fetch + load + replay + validate + gate）
+        合成数据（含体制切换）下 PASS：证明 pipeline 行为正确
+
+[下一步] 在你本机跑：
+        python fetch_btc_data.py --days 30
+        把 data/btc_1m_*.json 提交（或直接拷贝）到此目录
+        python stage0_validation.py --mode real --windows 4000
+
+[如果 PASS]  采集 2 周 Polymarket CLOB 订单簿历史，把微结构块换成真订单簿回放
+            → 进入"真实双轨阶段 0"
+            → 通过则进入阶段 1 paper trading
+
+[如果 FAIL]  方向 3 暂时砍掉。专注做市方向（D1/D2/D5/D6）——它们对 edge 不敏感，
+            靠的是 spread + 返佣 + 偏斜
+```
+
+---

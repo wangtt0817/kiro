@@ -5,3 +5,11 @@ __pycache__/
 
 # Generated backtest output (reproduce via: python run_all_directions.py)
 results_all_directions.json
+
+# Stage 0 reports (reproduce via: python stage0_validation.py --out ...)
+stage0_report_*.json
+
+# Cached BTC klines (fetched via fetch_btc_data.py — too large + non-deterministic to
+# commit). Run fetch_btc_data.py on a machine with internet to populate.
+data/btc_1m_*.json
+data/_fixture_*.json
