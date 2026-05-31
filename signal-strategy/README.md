@@ -55,17 +55,17 @@ STEP 8：白名单 lab/skyai/beat/bsb/wld…（结构性盈利）；黑名单 bt
 ## 2. 快速开始
 
 ```bash
-# 进入目录运行（模块间用裸名导入，需在本目录内执行）
+# 进入目录运行（标准库依赖，无需安装任何第三方包）
 cd signal-strategy
 
 # 合成数据自检（标定到真实统计）
-python3 run.py --events 20000 --seed 7
+python3 signal_strategy.py --events 20000 --seed 7
 
 # 方向 F：足球真实退出 vs 模拟退出对照
-python3 football_fix.py
+python3 signal_strategy.py --football
 
 # 接入真实合并数据
-python3 run.py --csv your_merged.csv
+python3 signal_strategy.py --csv your_merged.csv
 ```
 
 ### 合成数据自检的代表性结果
@@ -106,21 +106,29 @@ python3 run.py --csv your_merged.csv
 
 ---
 
-## 4. 模块结构
+## 4. 文件结构（单文件版）
+
+全部逻辑合并在 `signal_strategy.py` 一个文件内，按依赖顺序分 11 个章节
+（文件内用 `[n] 章节名` 注释分隔，便于定位）：
 
 ```
 signal-strategy/
-├── config.py        所有真实数据标定常量（改这里即可调参）
-├── datafeed.py      EventRow schema + 真实CSV加载 + 标定合成生成器
-├── features.py      滞后分桶 / stress 标志 / capitulation 判定
-├── session.py       方向 D：时段乘子
-├── universe.py      方向 E：白/黑名单 + 动态评分
-├── regime.py        方向 C：趋势/震荡判别
-├── signals.py       方向 A/B：信号生成（叠加全部过滤）
-├── portfolio.py     仓位计算 + 账户级风控（日亏限额/并发）
-├── backtest.py      事件驱动回测引擎 + 指标 + 多维归因
-├── run.py           CLI 入口（含朴素基线 + 样本内外切分）
-└── football_fix.py  方向 F：足球真实退出修复（独立可运行）
+├── signal_strategy.py   全部逻辑（单文件，标准库依赖，零第三方包）
+├── README.md            本文档
+└── .gitignore
+
+signal_strategy.py 内部章节:
+  [1]  CONFIG     所有真实数据标定常量（改这里即可调参）
+  [2]  DATAFEED   EventRow schema + 真实CSV加载 + 标定合成生成器
+  [3]  FEATURES   滞后分桶 / stress 标志 / capitulation 判定
+  [4]  SESSION    方向 D：时段乘子
+  [5]  UNIVERSE   方向 E：白/黑名单 + 动态评分
+  [6]  REGIME     方向 C：趋势/震荡判别
+  [7]  SIGNALS    方向 A/B：信号生成（叠加全部过滤）
+  [8]  PORTFOLIO  仓位计算 + 账户级风控（日亏限额/并发）
+  [9]  BACKTEST   事件驱动回测引擎 + 指标 + 多维归因
+  [10] FOOTBALL   方向 F：足球真实退出修复
+  [11] RUN        CLI 入口（含朴素基线 + 样本内外切分）
 ```
 
 信号流水线：
