@@ -24,8 +24,9 @@ RunningExchange = 'gate_usdt_swap'  # 当前交易所机器人数量约 150
 exchangeTopNum = 0  # Exchange 榜单前 N
 grafanaTopNum = 3  # Grafana 榜单前 N
 grafanahour = "15m"  # Grafana 榜单周期
-XBTTopNum = 0  # XBT 榜单前 N
-# XBT 和旧 Exchange 涨跌榜当前关闭，Gate 独立流动性选币由主循环触发
+XBTTopNum = strategy_config.XBT_TOP_NUM  # XBT 榜单前 N（0 表示关闭）
+XBTRobotNum = strategy_config.XBT_MIN_ROBOT_COUNT  # XBT 同币最少机器人数（一致性过滤）
+# Gate 独立流动性选币由主循环触发；XBT 作为已验证个体榜的优先选币源接入 check_profit_rate
 BLACKLIST_TOKENS_PATH = Path(__file__).with_name("blacklist_tokens.txt")
 STANDBY_RECORDS_PATH = Path(__file__).with_name("standby_records.json")
 GATE_SELECTION_MIN_24H_USDT = strategy_config.GATE_SELECTION_MIN_24H_USDT
@@ -924,20 +925,26 @@ def check_profit_rate(decide_actions=True):
             return
 
         if decide_actions:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                scan_future = executor.submit(run_grafana_market_decision, taskOptions_list, decide_actions)
-                gate_selection_future = executor.submit(getGateSelectionTop)
-                grafana_scores = scan_future.result() or {}
-                gate_selection_data = gate_selection_future.result()
-        else:
-            gate_selection_data = None
-            run_grafana_market_decision(taskOptions_list, decide_actions)
+            # 选币优先级：XBT（已验证个体榜+真实参数）> Grafana（全市场共识）> Gate（流动性探索）。
+            # 等待位(1_usdt)是共享有限资源，按优先级顺序抢占：先 XBT，再 Grafana，最后 Gate。
 
-        if decide_actions:
+            # 优先级1：XBT 已验证盈利个体榜，经 Grafana 趋势确认（仅在明确转坏时否决）
+            if XBTTopNum > 0:
+                xbt_candidates = confirm_candidates_by_grafana(getXbtTop() or [])
+                if xbt_candidates:
+                    topSetTest(RunningExchange, xbt_candidates)
+
+            # 优先级2：Grafana 全量决策（管理存量加减仓/停机 + 用剩余等待位开新仓）
+            grafana_scores = run_grafana_market_decision(taskOptions_list, decide_actions) or {}
+
+            # 优先级3：Gate 流动性探索（剔除已在 Grafana 榜的，避免与上游重复占位）
+            gate_selection_data = getGateSelectionTop()
             if gate_selection_data:
                 gate_selection_data = filter_gate_selection_by_grafana(gate_selection_data, grafana_scores)
             if gate_selection_data:
                 topSetTest(RunningExchange, gate_selection_data)
+        else:
+            run_grafana_market_decision(taskOptions_list, decide_actions)
 
 
 def run_grafana_market_decision(taskOptions_list, decide_actions=True):
@@ -1676,6 +1683,22 @@ def topSetTest(exchange, top_symbol_data=None):
 
             options_raw = update_item[0]['options_raw']
             ref_exchange, ref_symbol = bgExchang.getRefParment(RunningExchange, topItem['symbol'])
+            # XBT 候选携带已验证盈利机器人的真实参数；Gate/其它候选回退到随机 bp + 默认参考盘
+            xbt_params = topItem.get('xbt_params') or {}
+            if xbt_params.get('ref_exchange'):
+                ref_exchange = xbt_params['ref_exchange']
+            if xbt_params.get('ref_symbol'):
+                ref_symbol = xbt_params['ref_symbol']
+            copy_open = xbt_params['open'] if xbt_params.get('open') else ref_open2()
+            copy_close = xbt_params['close'] if xbt_params.get('close') else ref_close2()
+            if xbt_params.get('open'):
+                log_throttled(
+                    f"xbt_copy_params:{topItem['symbol']}",
+                    utils.getCurrenTime(RunningExchange)
+                    + f"{topItem['symbol']} 复制XBT最佳机器人参数：open={copy_open}, close={copy_close}, "
+                    + f"参考盘={ref_exchange}/{ref_symbol}, 该机器人收益率={xbt_params.get('return_rate')}%",
+                    5 * 60,
+                )
             for item in options_raw:
                 ref_lever, ref_lose = setItemLever(update_item[0]['init_balance'])
                 if item['name'] == 'opening_mode':
@@ -1689,9 +1712,9 @@ def topSetTest(exchange, top_symbol_data=None):
                 elif item['name'] == 'symbol':
                     item['value'] = topItem['symbol']
                 elif item['name'] == 'open':
-                    item['value'] = ref_open2()
+                    item['value'] = copy_open
                 elif item['name'] == 'close':
-                    item['value'] = ref_close2()
+                    item['value'] = copy_close
                 elif item['name'] == 'lever':
                     item['value'] = ref_lever
                 elif item['name'] == 'stop_lose_percent':
@@ -1795,29 +1818,129 @@ def log_gate_selection(selected_data, blacklist_count):
     log_throttled("gate_selection_summary", msg, 5 * 60)
 
 
+def _xbt_robot_return_rate(item):
+    """单台 XBT 机器人的收益率 = pnl / margin_equity；数据异常返回 None。"""
+    margin = _safe_float(item.get('margin_equity'))
+    if margin <= 0:
+        return None
+    return _safe_float(item.get('pnl')) / margin
+
+
+def _xbt_raw_param(item, name):
+    """从 XBT 机器人项里按多种可能结构提取某个参数值；找不到返回 None。
+
+    兼容三种结构：options_raw/options 为 [{'name','value'}] 列表、为 dict、或顶层扁平字段。
+    若实际字段名与此不同，只需在此函数补充即可，不影响其它逻辑。
+    """
+    for key in ('options_raw', 'options'):
+        container = item.get(key)
+        if isinstance(container, list):
+            for opt in container:
+                if isinstance(opt, dict) and opt.get('name') == name:
+                    return opt.get('value')
+        elif isinstance(container, dict) and name in container:
+            return container[name]
+    return item.get(name)
+
+
+def extract_xbt_best_params(xbtdata, symbol, exchange):
+    """取该币（指定交易所）收益率最高那台 XBT 机器人的 open/close bp 与参考盘。
+
+    任意关键字段缺失则返回 None，调用方回退到随机 bp + 默认参考盘，绝不注入垃圾值。
+    """
+    best_item = None
+    best_rate = None
+    for item in xbtdata or []:
+        if item.get('exchange') != exchange:
+            continue
+        if utils.normalize_symbol(str(item.get('symbol', ''))) != symbol:
+            continue
+        rate = _xbt_robot_return_rate(item)
+        if rate is None:
+            continue
+        if best_rate is None or rate > best_rate:
+            best_rate = rate
+            best_item = item
+    if best_item is None:
+        return None
+
+    open_raw = _xbt_raw_param(best_item, 'open')
+    close_raw = _xbt_raw_param(best_item, 'close')
+    if open_raw is None or close_raw is None:
+        return None
+    open_bp = _safe_float(open_raw)
+    close_bp = _safe_float(close_raw)
+    if open_bp <= 0 or close_bp <= 0:
+        return None
+
+    return {
+        'open': round(open_bp, 3),
+        'close': round(close_bp, 3),
+        'ref_exchange': _xbt_raw_param(best_item, 'ref_exchange'),
+        'ref_symbol': _xbt_raw_param(best_item, 'ref_symbol'),
+        'return_rate': round(best_rate * 100, 2),
+    }
+
+
 def getXbtTop():
-    result = xbtRobot.XbtLogin(xbtUsername, xbtPassword)
-    if result == 0:
-        xbtdata = xbtRobot.getXBTRobotParameter()
-        xbtGroupData = utils.xbt_group_and_count(xbtdata, RunningExchange, XBTRobotNum)
-        daily_sort_data = sorted(xbtGroupData, key=lambda x: x['total_daily_1h_rate'], reverse=True)[
-                          :XBTTopNum]  # 1. 按小时日化排序，并取前 N
-        pnl_sort_data = sorted(xbtGroupData, key=lambda x: x['total_pnl_rate'], reverse=True)[
-                        :XBTTopNum]  # 2. 按收益率排序，并取前 N
-        merge_data = utils.xbt_data_merge(daily_sort_data, pnl_sort_data)  # 3. 融合榜单数据
-        merge_sort_data = sorted(merge_data, key=lambda x: x['total_daily_1h_rate'], reverse=True)[
-                          :XBTTopNum]  # 4. 融合后再次按小时日化排序，并取前 N
-        preview = ", ".join(
-            f"{topItem['symbol']}({topItem['total_daily_1h_rate']}%)"
-            for topItem in merge_sort_data[:10]
-        )
-        msg = utils.getCurrenTime(
-            RunningExchange) + f"XBT融合榜单：设置数量={XBTTopNum}，入选={len(merge_sort_data)}"
-        if preview:
-            msg += f"，候选={preview}"
-        log_throttled("xbt_selection_summary", msg, 10 * 60)
-        return merge_sort_data
-    return None
+    if XBTTopNum <= 0:
+        return None
+    if xbtRobot.XbtLogin(xbtUsername, xbtPassword) != 0:
+        return None
+    xbtdata = xbtRobot.getXBTRobotParameter() or []
+    # xbt_group_and_count 已按 number >= XBTRobotNum 且 1h日化 > 0 过滤（一致性+方向）
+    xbtGroupData = utils.xbt_group_and_count(xbtdata, RunningExchange, XBTRobotNum)
+    daily_sort_data = sorted(xbtGroupData, key=lambda x: x['total_daily_1h_rate'], reverse=True)[:XBTTopNum]
+    pnl_sort_data = sorted(xbtGroupData, key=lambda x: x['total_pnl_rate'], reverse=True)[:XBTTopNum]
+    merge_data = utils.xbt_data_merge(daily_sort_data, pnl_sort_data)
+    merge_sort_data = sorted(merge_data, key=lambda x: x['total_daily_1h_rate'], reverse=True)[:XBTTopNum]
+
+    candidates = []
+    for topItem in merge_sort_data:
+        symbol = utils.normalize_symbol(str(topItem.get('symbol', '')))
+        params = extract_xbt_best_params(xbtdata, symbol, RunningExchange)
+        candidates.append({
+            'symbol': symbol,
+            'cumulative_sum': _safe_float(topItem.get('total_daily_1h_rate')),
+            'plan_count': 1,
+            'source': 'xbt',
+            'robot_count': topItem.get('number'),
+            'xbt_params': params,
+        })
+
+    preview = ", ".join(
+        f"{c['symbol']}(1h日化{c['cumulative_sum']:.2f}%, "
+        f"{'bp' + str(c['xbt_params']['open']) + '/' + str(c['xbt_params']['close']) if c['xbt_params'] else 'bp随机回退'})"
+        for c in candidates[:10]
+    )
+    msg = utils.getCurrenTime(RunningExchange) + f"XBT融合榜单：TopN={XBTTopNum}，最少机器人数={XBTRobotNum}，入选={len(candidates)}"
+    if preview:
+        msg += f"，候选={preview}"
+    log_throttled("xbt_selection_summary", msg, 10 * 60)
+    return candidates
+
+
+def confirm_candidates_by_grafana(candidates):
+    """XBT 已是已验证盈利源，这里只在 Grafana 明确转坏时否决（DOWN_TREND / 紧急停机 / 深亏禁用）。
+
+    Grafana 数据不足（data_fresh=False）时放行，避免冷启动期把好币全否决。
+    """
+    confirmed = []
+    for item in candidates or []:
+        symbol = item.get('symbol')
+        metrics = compute_grafana_symbol_metrics(symbol)
+        if metrics.get('data_fresh'):
+            action = decide_grafana_action(metrics, 'NONE')
+            if action in ('EMERGENCY_STOP', 'BAN_24H') or metrics.get('trend_state') == 'DOWN_TREND':
+                log_throttled(
+                    f"xbt_veto:{symbol}",
+                    utils.getCurrenTime(RunningExchange)
+                    + f"{symbol} XBT入选但Grafana转坏(trend={metrics.get('trend_state')}, action={action})，本轮否决。",
+                    10 * 60,
+                )
+                continue
+        confirmed.append(item)
+    return confirmed
 
 
 def run_Test():
