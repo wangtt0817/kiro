@@ -1,0 +1,7 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated backtest output (reproduce via: python run_all_directions.py)
+results_all_directions.json
